@@ -38,16 +38,17 @@ class Config:
     SESSION_TIMEOUT_MINUTES = int(os.getenv("SESSION_TIMEOUT_MINUTES", "10"))
 
     # ─── Feature Flags ───────────────────────────────────────────────────────
-    # ENABLE_GILT_SELECTION:
-    #   true  (default) → แสดงปุ่มให้ user เลือก "หมูสาว (Gilt)" / "หมูนาง (Sow)"
-    #   false           → ข้ามขั้นตอนเลือก วิเคราะห์เป็น "หมูนาง (Sow)" ทันที
     ENABLE_GILT_SELECTION: bool = (
         os.getenv("ENABLE_GILT_SELECTION", "true").lower() not in ("false", "0", "no")
     )
 
+    # ─── Daily Image Limit ───────────────────────────────────────────────────
+    # จำนวนรูปสูงสุดที่รับได้ต่อวัน (รวมทุกคนในกลุ่ม) รีเซ็ตทุก 23:59 PH time
+    # 0 = ไม่จำกัด
+    DAILY_IMAGE_LIMIT: int = int(os.getenv("DAILY_IMAGE_LIMIT", "0"))
+
     @classmethod
     def validate(cls) -> bool:
-        """ตรวจสอบว่า config สำคัญถูกตั้งค่าครบ"""
         missing = []
         if not cls.TELEGRAM_BOT_TOKEN:
             missing.append("TELEGRAM_BOT_TOKEN")

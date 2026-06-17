@@ -1,17 +1,14 @@
 """
-telegram_handlers.py — Telegram Bot Handlers v5
+telegram_handlers.py — Telegram Bot Handlers v6
 
 🆕 changes:
 1. Rate limiting — ป้องกัน user spam
-2. ไม่ save record ถ้า error (delegated to db.save_detection)
-3. filename มี timestamp PH + uuid 4 หลัก
-4. image_path ใน DB ชี้ไปที่ storage/ (ถาวร)
-5. Periodic cleanup session + rate limiter + temp_images
-6. /stats command สำหรับ admin
-7. ALLOWED_USER_IDS whitelist (optional)
-8. ALLOWED_GROUP_IDS whitelist (optional)
-9. Telegram 4096-char message truncation guard
-10. Raw storage — copy รูป + JSON ไปเก็บใน storage/YYYY-MM-DD/ ถาวร
+2. Daily image limit — จำกัดรูปรวมทั้งกลุ่มต่อวัน (DAILY_IMAGE_LIMIT)
+3. เมื่อเกิน limit → เก็บรูปใน storage/YYYY-MM-DD/overlimit/ ไม่วิเคราะห์
+4. image_path ใน DB ชี้ไปที่ storage/ ถาวร
+5. รองรับ ALLOWED_USER_IDS + ALLOWED_GROUP_IDS
+6. Raw storage — copy รูป + JSON ไปเก็บใน storage/YYYY-MM-DD/ ถาวร
+7. รีเซ็ต daily count ทุก 23:59 PH time
 """
 import glob
 import json
@@ -44,11 +41,57 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 CALLBACK_GILT = "pig_type:gilt"
 CALLBACK_SOW = "pig_type:sow"
-DEFAULT_PIG_TYPE_WHEN_DISABLED = "sow"
+DEFAULT_PIG_TYPE_WHEN_DISABLED = "gilt"
 TG_MAX_CHARS = 4096
 STORAGE_DIR = "./storage"
 
-# Whitelist users
+# =============================================================================
+# Daily limit counter (in-memory, รีเซ็ตตามวัน PH)
+# =============================================================================
+_daily_count: int = 0
+_daily_date: str = ""  # YYYY-MM-DD ของ PH
+
+
+def _get_today_ph() -> str:
+    return datetime.now(PH_TZ).strftime("%Y-%m-%d")
+
+
+def _check_daily_limit() -> tuple[bool, int]:
+    """
+    ตรวจว่ายังไม่เกิน limit ไหม
+    Return: (allowed, current_count)
+    - allowed=True  → ยังส่งได้
+    - allowed=False → เกิน limit แล้ว
+    """
+    global _daily_count, _daily_date
+
+    today = _get_today_ph()
+    if _daily_date != today:
+        # วันใหม่ — รีเซ็ต
+        _daily_count = 0
+        _daily_date = today
+        logger.info(f"🔄 Daily limit reset for {today}")
+
+    limit = Config.DAILY_IMAGE_LIMIT
+    if limit <= 0:
+        # ไม่จำกัด
+        return True, _daily_count
+
+    if _daily_count >= limit:
+        return False, _daily_count
+
+    return True, _daily_count
+
+
+def _increment_daily_count() -> int:
+    global _daily_count
+    _daily_count += 1
+    return _daily_count
+
+
+# =============================================================================
+# Whitelist
+# =============================================================================
 _ALLOWED_IDS: set[int] = set()
 _raw_ids = os.getenv("ALLOWED_USER_IDS", "").strip()
 if _raw_ids:
@@ -58,7 +101,6 @@ if _raw_ids:
             _ALLOWED_IDS.add(int(_id))
     logger.info(f"🔒 User whitelist: {len(_ALLOWED_IDS)} user(s)")
 
-# Whitelist groups
 _ALLOWED_GROUP_IDS: set[int] = set()
 _raw_groups = os.getenv("ALLOWED_GROUP_IDS", "").strip()
 if _raw_groups:
@@ -73,7 +115,6 @@ if _raw_groups:
 # Helpers
 # =============================================================================
 def _is_allowed(user_id: int, chat_id: int | None = None) -> bool:
-    """ผ่านถ้า: ไม่มี whitelist เลย / user อยู่ใน list / chat อยู่ใน group list"""
     no_user_list = not _ALLOWED_IDS
     no_group_list = not _ALLOWED_GROUP_IDS
     if no_user_list and no_group_list:
@@ -111,6 +152,22 @@ async def _check_rate_limit(update: Update) -> bool:
     return True
 
 
+def _save_overlimit_image(image_path: str, user_id: int) -> None:
+    """เก็บรูปที่เกิน limit ไว้ใน overlimit/ โดยไม่สร้าง JSON"""
+    try:
+        date_str = _get_today_ph()
+        overlimit_dir = os.path.join(STORAGE_DIR, date_str, "overlimit")
+        os.makedirs(overlimit_dir, exist_ok=True)
+
+        timestamp = datetime.now(PH_TZ).strftime("%H%M%S")
+        img_ext = os.path.splitext(image_path)[1] or ".jpg"
+        dest = os.path.join(overlimit_dir, f"{timestamp}_{user_id}{img_ext}")
+        shutil.copy2(image_path, dest)
+        logger.info(f"📦 Overlimit image saved: {dest}")
+    except Exception as e:
+        logger.warning(f"⚠️ Failed to save overlimit image: {e}")
+
+
 def _copy_to_storage(
     image_path: str,
     detection_id: int | None,
@@ -123,7 +180,7 @@ def _copy_to_storage(
     sow_id: str | None,
 ) -> str | None:
     try:
-        date_str = datetime.now(PH_TZ).strftime("%Y-%m-%d")
+        date_str = _get_today_ph()
         day_dir = os.path.join(STORAGE_DIR, date_str)
         os.makedirs(day_dir, exist_ok=True)
 
@@ -252,9 +309,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "⛔ Sorry, you are not authorized to use this system."
         )
         return
+    limit = Config.DAILY_IMAGE_LIMIT
+    limit_text = f"{limit} รูป/วัน" if limit > 0 else "ไม่จำกัด"
+    limit_text_en = f"{limit} photos/day" if limit > 0 else "Unlimited"
     msg = (
         "📖 คู่มือการใช้งาน\n\n"
         "• ส่งรูป → บอทวิเคราะห์ → ส่งผลกลับ\n\n"
+        f"• จำนวนรูปต่อวัน: {limit_text}\n\n"
         "คำสั่ง:\n"
         "/start  - เริ่มต้น\n"
         "/help   - คู่มือ\n"
@@ -269,6 +330,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "---\n"
         "📖 User Guide\n\n"
         "• Send photo → Bot analyzes → Results returned\n\n"
+        f"• Daily limit: {limit_text_en}\n\n"
         "Commands:\n"
         "/start  - Start\n"
         "/help   - Help\n"
@@ -350,10 +412,14 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "False Estrus or Pathology Suspect": "🛑",
         }
 
+        limit = Config.DAILY_IMAGE_LIMIT
+        remaining = max(0, limit - _daily_count) if limit > 0 else "ไม่จำกัด / Unlimited"
+
         lines = [
             "📊 สถิติการวิเคราะห์\n",
             f"  • ทั้งหมด    : {total} ครั้ง",
-            f"  • วันนี้      : {today} ครั้ง\n",
+            f"  • วันนี้      : {today} ครั้ง",
+            f"  • คงเหลือวันนี้: {remaining} รูป\n",
             "แยกตาม Classification:",
         ]
         for cls, cnt in sorted(by_class, key=lambda x: -x[1]):
@@ -364,7 +430,8 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "\n---",
             "📊 Analysis Statistics\n",
             f"  • Total   : {total} records",
-            f"  • Today   : {today} records\n",
+            f"  • Today   : {today} records",
+            f"  • Remaining today: {remaining} photos\n",
             "By Classification:",
         ]
         for cls, cnt in sorted(by_class, key=lambda x: -x[1]):
@@ -414,6 +481,22 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await photo_file.download_to_drive(image_path)
         logger.info(f"📥 Image downloaded: {image_path}")
 
+        # === เช็ค Daily Limit ===
+        allowed, current_count = _check_daily_limit()
+        if not allowed:
+            limit = Config.DAILY_IMAGE_LIMIT
+            _save_overlimit_image(image_path, user.id)
+            await message.reply_text(
+                f"🚫 ครบจำนวนการวิเคราะห์รายวันแล้ว ({current_count}/{limit} รูป)\n"
+                "โปรดลองใหม่ในวันถัดไป (รีเซ็ตทุกเที่ยงคืน)\n\n"
+                f"🚫 Daily analysis limit reached ({current_count}/{limit} photos)\n"
+                "Please try again tomorrow (resets at midnight)."
+            )
+            return
+
+        # === เพิ่ม counter ===
+        _increment_daily_count()
+
         session_mgr = get_session_manager()
         session_mgr.create(
             user_id=user.id,
@@ -438,7 +521,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         sent = await message.reply_text(
-            "🔍 กำลังวิเคราะห์ภาพ (หมูนาง) / Analyzing (Sow)...\n"
+            "🔍 กำลังวิเคราะห์ภาพ (หมูสาว) / Analyzing (Gilt)...\n"
             "⏱️ กรุณารอสักครู่... / Please wait..."
         )
         await _run_analysis_pipeline(
@@ -606,7 +689,7 @@ async def _run_analysis_pipeline(
         logger.info(
             f"✅ Pipeline done user={user.id} pig_type={pig_type} "
             f"class={alert.classification} status={alert.status} "
-            f"record_id={detection_id}"
+            f"record_id={detection_id} daily_count={_daily_count}"
         )
 
     except Exception:
