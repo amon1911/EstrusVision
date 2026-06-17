@@ -1,19 +1,23 @@
 """
 telegram_handlers.py — Telegram Bot Handlers
 
-🆕 v4 changes:
+🆕 v5 changes:
 1. Rate limiting — ป้องกัน user spam
-2. ไม่ save record ถ้า error (delegated to db.save_detection)
-3. filename มี timestamp PH + uuid 4 หลัก
-4. image_path เก็บจริงลง DB
-5. Periodic cleanup session + rate limiter + temp_images
-6. /stats command สำหรับ admin
-7. ALLOWED_USER_IDS whitelist (optional)
-8. Telegram 4096-char message truncation guard
+2. sow_id input — รับจาก photo caption หรือ next text message
+3. ไม่ save record ถ้า error (delegated to db.save_detection)
+4. filename มี timestamp PH + uuid 4 หลัก
+5. image_path เก็บจริงลง DB
+6. Periodic cleanup session + rate limiter (ไม่ลบ temp_images แล้ว)
+7. /stats command สำหรับ admin
+8. ALLOWED_USER_IDS whitelist (optional)
+9. Telegram 4096-char message truncation guard
+10. Raw storage — copy รูป + JSON ไปเก็บใน storage/YYYY-MM-DD/ ถาวร
 """
 import glob
+import json
 import logging
 import os
+import shutil
 import uuid
 from datetime import datetime
 
@@ -42,10 +46,9 @@ CALLBACK_GILT = "pig_type:gilt"
 CALLBACK_SOW = "pig_type:sow"
 DEFAULT_PIG_TYPE_WHEN_DISABLED = "sow"
 TG_MAX_CHARS = 4096  # Telegram message limit
+STORAGE_DIR = "./storage"  # root สำหรับเก็บ raw data ถาวร
 
-# Whitelist: ถ้าตั้งค่า ALLOWED_USER_IDS ใน .env จะจำกัดเฉพาะ user เหล่านี้
-# ตัวอย่าง: ALLOWED_USER_IDS=123456,789012
-# ถ้าไม่ตั้งค่า (ว่าง) → ทุกคนใช้ได้
+# Whitelist
 _ALLOWED_IDS: set[int] = set()
 _raw_ids = os.getenv("ALLOWED_USER_IDS", "").strip()
 if _raw_ids:
@@ -60,14 +63,12 @@ if _raw_ids:
 # Helpers
 # =============================================================================
 def _is_allowed(user_id: int) -> bool:
-    """ถ้าไม่มี whitelist → ทุกคนผ่าน"""
     if not _ALLOWED_IDS:
         return True
     return user_id in _ALLOWED_IDS
 
 
 def _truncate(text: str, limit: int = TG_MAX_CHARS) -> str:
-    """ตัดข้อความให้ไม่เกิน Telegram limit พร้อมแจ้งว่าถูกตัด"""
     if len(text) <= limit:
         return text
     suffix = "\n\n⚠️ [ข้อความถูกตัดเพราะยาวเกินขีดจำกัด / Message truncated]"
@@ -75,7 +76,6 @@ def _truncate(text: str, limit: int = TG_MAX_CHARS) -> str:
 
 
 async def _check_rate_limit(update: Update) -> bool:
-    """ตรวจ rate limit — return True ถ้าผ่าน"""
     user_id = update.effective_user.id
     limiter = get_rate_limiter()
     result = limiter.check(user_id)
@@ -92,6 +92,55 @@ async def _check_rate_limit(update: Update) -> bool:
         )
         return False
     return True
+
+
+def _save_to_storage(
+    image_path: str,
+    detection_id: int | None,
+    vlm_result: dict,
+    alert_status: str,
+    alert_message: str,
+    pig_type: str,
+    user_id: int,
+    username: str | None,
+    sow_id: str | None,
+) -> None:
+    """Copy รูป + สร้าง JSON ไปเก็บใน storage/YYYY-MM-DD/ ถาวร"""
+    try:
+        date_str = datetime.now(PH_TZ).strftime("%Y-%m-%d")
+        day_dir = os.path.join(STORAGE_DIR, date_str)
+        os.makedirs(day_dir, exist_ok=True)
+
+        # ชื่อไฟล์ใช้ timestamp + detection_id
+        timestamp = datetime.now(PH_TZ).strftime("%H%M%S")
+        base_name = f"{timestamp}_id{detection_id or 'err'}_{user_id}"
+
+        # Copy รูป
+        img_ext = os.path.splitext(image_path)[1] or ".jpg"
+        dest_image = os.path.join(day_dir, f"{base_name}{img_ext}")
+        shutil.copy2(image_path, dest_image)
+
+        # สร้าง JSON
+        payload = {
+            "detection_id": detection_id,
+            "timestamp_ph": datetime.now(PH_TZ).isoformat(),
+            "user_id": user_id,
+            "username": username,
+            "pig_type": pig_type,
+            "sow_id": sow_id,
+            "result_status": alert_status,
+            "vlm_raw": vlm_result,
+            "alert_message": alert_message,
+            "image_file": os.path.basename(dest_image),
+        }
+        dest_json = os.path.join(day_dir, f"{base_name}.json")
+        with open(dest_json, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+
+        logger.info(f"📦 Stored raw data: {dest_image} + {dest_json}")
+
+    except Exception as e:
+        logger.warning(f"⚠️ Failed to save storage: {e}")
 
 
 def _cleanup_stale_temp_images() -> int:
@@ -113,7 +162,7 @@ def _cleanup_stale_temp_images() -> int:
 
 
 # =============================================================================
-# Periodic cleanup job (ลงทะเบียนใน main.py ผ่าน job_queue)
+# Periodic cleanup job
 # =============================================================================
 async def periodic_cleanup(context: ContextTypes.DEFAULT_TYPE) -> None:
     """รันทุก 5 นาที — cleanup session, rate limiter, temp images"""
@@ -229,9 +278,6 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /stats — แสดงสถิติจาก DB (เฉพาะ whitelist หรือทุกคนถ้าไม่ได้ตั้ง whitelist)
-    """
     if not _is_allowed(update.effective_user.id):
         await update.message.reply_text(
             "⛔ ขออภัย คุณไม่มีสิทธิ์ใช้งานระบบนี้\n"
@@ -307,11 +353,9 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Photo handler
 # =============================================================================
 async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """รับรูป → ดาวน์โหลด → เก็บใน session"""
     user = update.effective_user
     message = update.message
 
-    # === Whitelist check ===
     if not _is_allowed(user.id):
         await message.reply_text(
             "⛔ ขออภัย คุณไม่มีสิทธิ์ใช้งานระบบนี้\n"
@@ -319,7 +363,6 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # === Rate limit ===
     if not await _check_rate_limit(update):
         return
 
@@ -347,7 +390,6 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             image_file_id=file_id,
         )
 
-        # === Path A: เปิดปุ่มเลือก ===
         if Config.ENABLE_GILT_SELECTION:
             keyboard = [
                 [
@@ -362,7 +404,6 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # === Path B: ปิดปุ่มเลือก → วิเคราะห์เลย ===
         sent = await message.reply_text(
             "🔍 กำลังวิเคราะห์ภาพ (หมูนาง) / Analyzing (Sow)...\n"
             "⏱️ กรุณารอสักครู่... / Please wait..."
@@ -442,7 +483,6 @@ async def _run_analysis_pipeline(
     edit_target,
     use_edit: bool = False,
 ) -> None:
-    """Pipeline สำหรับทั้ง 2 flow (มีปุ่ม / ไม่มีปุ่ม)"""
     user = update.effective_user
     session_mgr = get_session_manager()
     session = session_mgr.get(user.id)
@@ -461,6 +501,8 @@ async def _run_analysis_pipeline(
         else:
             await edit_target.reply_text(text)
         return
+
+    sow_id = getattr(session, "sow_id", None)
 
     try:
         # === VLM ===
@@ -483,10 +525,27 @@ async def _run_analysis_pipeline(
             vlm_result=vlm_result,
             result_status=alert.status,
             alert_message=alert.message,
+            sow_id=sow_id,
         )
 
-        # === Compose final + truncate guard ===
-        final_text = append_record_id(alert.message, detection_id)
+        # === Save raw storage (รูป + JSON ถาวร) ===
+        _save_to_storage(
+            image_path=session.image_path,
+            detection_id=detection_id,
+            vlm_result=vlm_result if isinstance(vlm_result, dict) else vars(vlm_result),
+            alert_status=alert.status,
+            alert_message=alert.message,
+            pig_type=pig_type,
+            user_id=user.id,
+            username=user.username,
+            sow_id=sow_id,
+        )
+
+        # === Compose final ===
+        final_text = alert.message
+        if sow_id:
+            final_text = f"📌 รหัสหมู / Pig ID: {sow_id}\n\n{final_text}"
+        final_text = append_record_id(final_text, detection_id)
         final_text = _truncate(final_text)
 
         if use_edit:
