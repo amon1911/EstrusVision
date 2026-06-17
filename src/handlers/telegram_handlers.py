@@ -3,15 +3,14 @@ telegram_handlers.py — Telegram Bot Handlers
 
 🆕 v5 changes:
 1. Rate limiting — ป้องกัน user spam
-2. sow_id input — รับจาก photo caption หรือ next text message
-3. ไม่ save record ถ้า error (delegated to db.save_detection)
-4. filename มี timestamp PH + uuid 4 หลัก
-5. image_path เก็บจริงลง DB
-6. Periodic cleanup session + rate limiter (ไม่ลบ temp_images แล้ว)
-7. /stats command สำหรับ admin
-8. ALLOWED_USER_IDS whitelist (optional)
-9. Telegram 4096-char message truncation guard
-10. Raw storage — copy รูป + JSON ไปเก็บใน storage/YYYY-MM-DD/ ถาวร
+2. ไม่ save record ถ้า error (delegated to db.save_detection)
+3. filename มี timestamp PH + uuid 4 หลัก
+4. image_path ใน DB ชี้ไปที่ storage/ (ถาวร) แทน temp_images/
+5. Periodic cleanup session + rate limiter + temp_images
+6. /stats command สำหรับ admin
+7. ALLOWED_USER_IDS whitelist (optional)
+8. Telegram 4096-char message truncation guard
+9. Raw storage — copy รูป + JSON ไปเก็บใน storage/YYYY-MM-DD/ ถาวร
 """
 import glob
 import json
@@ -45,8 +44,8 @@ logger = logging.getLogger(__name__)
 CALLBACK_GILT = "pig_type:gilt"
 CALLBACK_SOW = "pig_type:sow"
 DEFAULT_PIG_TYPE_WHEN_DISABLED = "sow"
-TG_MAX_CHARS = 4096  # Telegram message limit
-STORAGE_DIR = "./storage"  # root สำหรับเก็บ raw data ถาวร
+TG_MAX_CHARS = 4096
+STORAGE_DIR = "./storage"
 
 # Whitelist
 _ALLOWED_IDS: set[int] = set()
@@ -94,7 +93,7 @@ async def _check_rate_limit(update: Update) -> bool:
     return True
 
 
-def _save_to_storage(
+def _copy_to_storage(
     image_path: str,
     detection_id: int | None,
     vlm_result: dict,
@@ -104,14 +103,17 @@ def _save_to_storage(
     user_id: int,
     username: str | None,
     sow_id: str | None,
-) -> None:
-    """Copy รูป + สร้าง JSON ไปเก็บใน storage/YYYY-MM-DD/ ถาวร"""
+) -> str | None:
+    """
+    Copy รูปไปเก็บถาวรใน storage/YYYY-MM-DD/
+    สร้าง JSON คู่ไว้ด้วย
+    Return: path ของรูปใน storage (สำหรับเก็บลง DB) หรือ None ถ้า error
+    """
     try:
         date_str = datetime.now(PH_TZ).strftime("%Y-%m-%d")
         day_dir = os.path.join(STORAGE_DIR, date_str)
         os.makedirs(day_dir, exist_ok=True)
 
-        # ชื่อไฟล์ใช้ timestamp + detection_id
         timestamp = datetime.now(PH_TZ).strftime("%H%M%S")
         base_name = f"{timestamp}_id{detection_id or 'err'}_{user_id}"
 
@@ -129,22 +131,30 @@ def _save_to_storage(
             "pig_type": pig_type,
             "sow_id": sow_id,
             "result_status": alert_status,
-            "vlm_raw": vlm_result,
+            "estrus_classification": vlm_result.get("estrus_classification"),
+            "confidence": vlm_result.get("confidence"),
+            "observed_signs": vlm_result.get("observed_signs", {}),
+            "reasoning_summary": vlm_result.get("reasoning_summary"),
+            "recommended_action": vlm_result.get("recommended_action"),
+            "image_quality": vlm_result.get("image_quality"),
+            "visibility_issues": vlm_result.get("visibility_issues", []),
             "alert_message": alert_message,
             "image_file": os.path.basename(dest_image),
+            "vlm_raw": vlm_result,
         }
         dest_json = os.path.join(day_dir, f"{base_name}.json")
         with open(dest_json, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
 
-        logger.info(f"📦 Stored raw data: {dest_image} + {dest_json}")
+        logger.info(f"📦 Stored: {dest_image} + {dest_json}")
+        return dest_image
 
     except Exception as e:
         logger.warning(f"⚠️ Failed to save storage: {e}")
+        return None
 
 
 def _cleanup_stale_temp_images() -> int:
-    """ลบไฟล์ temp ที่ค้างอยู่นานเกิน SESSION_TIMEOUT_MINUTES * 2"""
     threshold = Config.SESSION_TIMEOUT_MINUTES * 60 * 2
     now = datetime.now().timestamp()
     removed = 0
@@ -165,7 +175,6 @@ def _cleanup_stale_temp_images() -> int:
 # Periodic cleanup job
 # =============================================================================
 async def periodic_cleanup(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """รันทุก 5 นาที — cleanup session, rate limiter, temp images"""
     session_mgr = get_session_manager()
     session_mgr.cleanup_expired()
 
@@ -503,34 +512,35 @@ async def _run_analysis_pipeline(
         return
 
     sow_id = getattr(session, "sow_id", None)
+    temp_image_path = session.image_path
 
     try:
         # === VLM ===
         vlm = get_vlm_service()
         vlm_result = await vlm.analyze_estrus(
-            image_path=session.image_path, pig_type=pig_type
+            image_path=temp_image_path, pig_type=pig_type
         )
 
         # === Business logic ===
         alert = generate_alert(vlm_result, pig_type)
 
-        # === Save DB ===
+        # === Save DB (ใช้ temp path ก่อน) ===
         detection_id = save_detection(
             telegram_user_id=user.id,
             telegram_username=user.username,
             telegram_first_name=user.first_name,
             pig_type=pig_type,
             image_file_id=session.image_file_id,
-            image_path=session.image_path,
+            image_path=temp_image_path,
             vlm_result=vlm_result,
             result_status=alert.status,
             alert_message=alert.message,
             sow_id=sow_id,
         )
 
-        # === Save raw storage (รูป + JSON ถาวร) ===
-        _save_to_storage(
-            image_path=session.image_path,
+        # === Copy ไปเก็บใน storage/ ถาวร ===
+        storage_image_path = _copy_to_storage(
+            image_path=temp_image_path,
             detection_id=detection_id,
             vlm_result=vlm_result if isinstance(vlm_result, dict) else vars(vlm_result),
             alert_status=alert.status,
@@ -540,6 +550,21 @@ async def _run_analysis_pipeline(
             username=user.username,
             sow_id=sow_id,
         )
+
+        # === อัปเดต image_path ใน DB ให้ชี้ไปที่ storage ===
+        if storage_image_path and detection_id:
+            try:
+                from src.database.db import get_session as db_session
+                from src.database.models import EstrusDetection
+                with db_session() as db_sess:
+                    record = db_sess.query(EstrusDetection).filter(
+                        EstrusDetection.id == detection_id
+                    ).first()
+                    if record:
+                        record.image_path = storage_image_path
+                logger.info(f"📝 Updated image_path → {storage_image_path}")
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to update image_path: {e}")
 
         # === Compose final ===
         final_text = alert.message
