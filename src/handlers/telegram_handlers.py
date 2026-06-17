@@ -1,16 +1,17 @@
 """
-telegram_handlers.py — Telegram Bot Handlers
+telegram_handlers.py — Telegram Bot Handlers v5
 
-🆕 v5 changes:
+🆕 changes:
 1. Rate limiting — ป้องกัน user spam
 2. ไม่ save record ถ้า error (delegated to db.save_detection)
 3. filename มี timestamp PH + uuid 4 หลัก
-4. image_path ใน DB ชี้ไปที่ storage/ (ถาวร) แทน temp_images/
+4. image_path ใน DB ชี้ไปที่ storage/ (ถาวร)
 5. Periodic cleanup session + rate limiter + temp_images
 6. /stats command สำหรับ admin
 7. ALLOWED_USER_IDS whitelist (optional)
-8. Telegram 4096-char message truncation guard
-9. Raw storage — copy รูป + JSON ไปเก็บใน storage/YYYY-MM-DD/ ถาวร
+8. ALLOWED_GROUP_IDS whitelist (optional)
+9. Telegram 4096-char message truncation guard
+10. Raw storage — copy รูป + JSON ไปเก็บใน storage/YYYY-MM-DD/ ถาวร
 """
 import glob
 import json
@@ -47,24 +48,41 @@ DEFAULT_PIG_TYPE_WHEN_DISABLED = "sow"
 TG_MAX_CHARS = 4096
 STORAGE_DIR = "./storage"
 
-# Whitelist
+# Whitelist users
 _ALLOWED_IDS: set[int] = set()
 _raw_ids = os.getenv("ALLOWED_USER_IDS", "").strip()
 if _raw_ids:
     for _id in _raw_ids.split(","):
         _id = _id.strip()
-        if _id.isdigit():
+        if _id.lstrip("-").isdigit():
             _ALLOWED_IDS.add(int(_id))
-    logger.info(f"🔒 Whitelist enabled: {len(_ALLOWED_IDS)} user(s)")
+    logger.info(f"🔒 User whitelist: {len(_ALLOWED_IDS)} user(s)")
+
+# Whitelist groups
+_ALLOWED_GROUP_IDS: set[int] = set()
+_raw_groups = os.getenv("ALLOWED_GROUP_IDS", "").strip()
+if _raw_groups:
+    for _gid in _raw_groups.split(","):
+        _gid = _gid.strip()
+        if _gid.lstrip("-").isdigit():
+            _ALLOWED_GROUP_IDS.add(int(_gid))
+    logger.info(f"🔒 Group whitelist: {len(_ALLOWED_GROUP_IDS)} group(s)")
 
 
 # =============================================================================
 # Helpers
 # =============================================================================
-def _is_allowed(user_id: int) -> bool:
-    if not _ALLOWED_IDS:
+def _is_allowed(user_id: int, chat_id: int | None = None) -> bool:
+    """ผ่านถ้า: ไม่มี whitelist เลย / user อยู่ใน list / chat อยู่ใน group list"""
+    no_user_list = not _ALLOWED_IDS
+    no_group_list = not _ALLOWED_GROUP_IDS
+    if no_user_list and no_group_list:
         return True
-    return user_id in _ALLOWED_IDS
+    if user_id in _ALLOWED_IDS:
+        return True
+    if chat_id and chat_id in _ALLOWED_GROUP_IDS:
+        return True
+    return False
 
 
 def _truncate(text: str, limit: int = TG_MAX_CHARS) -> str:
@@ -104,11 +122,6 @@ def _copy_to_storage(
     username: str | None,
     sow_id: str | None,
 ) -> str | None:
-    """
-    Copy รูปไปเก็บถาวรใน storage/YYYY-MM-DD/
-    สร้าง JSON คู่ไว้ด้วย
-    Return: path ของรูปใน storage (สำหรับเก็บลง DB) หรือ None ถ้า error
-    """
     try:
         date_str = datetime.now(PH_TZ).strftime("%Y-%m-%d")
         day_dir = os.path.join(STORAGE_DIR, date_str)
@@ -117,12 +130,10 @@ def _copy_to_storage(
         timestamp = datetime.now(PH_TZ).strftime("%H%M%S")
         base_name = f"{timestamp}_id{detection_id or 'err'}_{user_id}"
 
-        # Copy รูป
         img_ext = os.path.splitext(image_path)[1] or ".jpg"
         dest_image = os.path.join(day_dir, f"{base_name}{img_ext}")
         shutil.copy2(image_path, dest_image)
 
-        # สร้าง JSON
         payload = {
             "detection_id": detection_id,
             "timestamp_ph": datetime.now(PH_TZ).isoformat(),
@@ -191,7 +202,8 @@ async def periodic_cleanup(context: ContextTypes.DEFAULT_TYPE) -> None:
 # =============================================================================
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if not _is_allowed(user.id):
+    chat_id = update.effective_chat.id
+    if not _is_allowed(user.id, chat_id):
         await update.message.reply_text(
             "⛔ ขออภัย คุณไม่มีสิทธิ์ใช้งานระบบนี้\n"
             "⛔ Sorry, you are not authorized to use this system."
@@ -232,7 +244,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_allowed(update.effective_user.id):
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    if not _is_allowed(user.id, chat_id):
         await update.message.reply_text(
             "⛔ ขออภัย คุณไม่มีสิทธิ์ใช้งานระบบนี้\n"
             "⛔ Sorry, you are not authorized to use this system."
@@ -272,6 +286,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    if not _is_allowed(user_id, chat_id):
+        await update.message.reply_text(
+            "⛔ ขออภัย คุณไม่มีสิทธิ์ใช้งานระบบนี้\n"
+            "⛔ Sorry, you are not authorized to use this system."
+        )
+        return
     session_mgr = get_session_manager()
     if session_mgr.get(user_id):
         session_mgr.clear(user_id)
@@ -287,7 +308,9 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_allowed(update.effective_user.id):
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    if not _is_allowed(user.id, chat_id):
         await update.message.reply_text(
             "⛔ ขออภัย คุณไม่มีสิทธิ์ใช้งานระบบนี้\n"
             "⛔ Sorry, you are not authorized to use this system."
@@ -364,8 +387,9 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     message = update.message
+    chat_id = update.effective_chat.id
 
-    if not _is_allowed(user.id):
+    if not _is_allowed(user.id, chat_id):
         await message.reply_text(
             "⛔ ขออภัย คุณไม่มีสิทธิ์ใช้งานระบบนี้\n"
             "⛔ Sorry, you are not authorized to use this system."
@@ -467,8 +491,9 @@ async def pig_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =============================================================================
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
 
-    if not _is_allowed(user_id):
+    if not _is_allowed(user_id, chat_id):
         await update.message.reply_text(
             "⛔ ขออภัย คุณไม่มีสิทธิ์ใช้งานระบบนี้\n"
             "⛔ Sorry, you are not authorized to use this system."
@@ -524,7 +549,7 @@ async def _run_analysis_pipeline(
         # === Business logic ===
         alert = generate_alert(vlm_result, pig_type)
 
-        # === Save DB (ใช้ temp path ก่อน) ===
+        # === Save DB ===
         detection_id = save_detection(
             telegram_user_id=user.id,
             telegram_username=user.username,
@@ -551,7 +576,7 @@ async def _run_analysis_pipeline(
             sow_id=sow_id,
         )
 
-        # === อัปเดต image_path ใน DB ให้ชี้ไปที่ storage ===
+        # === อัปเดต image_path ใน DB → storage ===
         if storage_image_path and detection_id:
             try:
                 from src.database.db import get_session as db_session
