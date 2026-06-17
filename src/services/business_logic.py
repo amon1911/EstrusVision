@@ -6,8 +6,8 @@ business_logic.py — Decision rules + Multi-language message composition
 2. Disclaimer เป็น fixed text จาก i18n (ไม่ดึงจากผลวิเคราะห์)
 3. ข้อความ output เป็น plain text — ไม่มี markdown
 4. ไม่มี short-circuit bad_image ที่ส่งข้อความ generic ทับผลจริง
-   (ถ้า VLM ตอบมาแล้ว ให้แสดงผล + เตือนคุณภาพภาพแทน)
 5. คืน AlertResult (dataclass) — typed, immutable, easy to test
+6. ลบ behavior ออกจาก output (ไม่สามารถประเมินจากภาพนิ่ง)
 """
 import logging
 from dataclasses import dataclass
@@ -62,15 +62,14 @@ CLASSIFICATION_MAP: dict[str, tuple[str, str, str, str]] = {
 # Section builders
 # =============================================================================
 def _build_signs_section(signs: dict) -> str:
-    """แสดงผลการประเมินอาการ"""
+    """แสดงผลการประเมินอาการ (ไม่มี behavior — ประเมินจากภาพไม่ได้)"""
     return (
         f"{t('section_signs')}\n"
         f"  • {t('label_swelling', inline=True)}: {te('swelling', signs.get('vulva_swelling', ''))}\n"
         f"  • {t('label_color', inline=True)}: {te('color', signs.get('vulva_color', ''))}\n"
         f"  • {t('label_clitoris', inline=True)}: {te('clitoris', signs.get('clitoris_state', ''))}\n"
         f"  • {t('label_mucus', inline=True)}: {te('mucus', signs.get('mucus', ''))}\n"
-        f"  • {t('label_tail', inline=True)}: {te('tail', signs.get('tail_position', ''))}\n"
-        f"  • {t('label_behavior', inline=True)}: {te('behavior', signs.get('behavior', ''))}"
+        f"  • {t('label_tail', inline=True)}: {te('tail', signs.get('tail_position', ''))}"
     )
 
 
@@ -159,7 +158,7 @@ def generate_alert(vlm_result: dict, pig_type: str) -> AlertResult:
         t("disclaimer"),
     ]
 
-    # === เตือน poor image (ไม่ว่า classification จะเป็นอะไร) ===
+    # === เตือน poor image ===
     if image_quality == "poor":
         parts.append("")
         parts.append(t("poor_image_warning"))
