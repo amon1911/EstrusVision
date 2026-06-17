@@ -1,0 +1,44 @@
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: estrus_bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./logs:/app/logs
+      - ./temp_images:/app/temp_images
+    networks:
+      - estrus_net
+
+  db:
+    image: postgres:16-alpine
+    container_name: estrus_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-estrus}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-estrus_pass}
+      POSTGRES_DB: ${POSTGRES_DB:-estrus_db}
+    ports:
+      - "5432:5432"
+    volumes:
+      - estrus_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-estrus}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - estrus_net
+
+volumes:
+  estrus_pgdata:
+
+networks:
+  estrus_net:
+    driver: bridge

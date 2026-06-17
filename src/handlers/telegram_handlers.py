@@ -1,0 +1,529 @@
+"""
+telegram_handlers.py — Telegram Bot Handlers
+
+🆕 v4 changes:
+1. Rate limiting — ป้องกัน user spam
+2. ไม่ save record ถ้า error (delegated to db.save_detection)
+3. filename มี timestamp PH + uuid 4 หลัก
+4. image_path เก็บจริงลง DB
+5. Periodic cleanup session + rate limiter + temp_images
+6. /stats command สำหรับ admin
+7. ALLOWED_USER_IDS whitelist (optional)
+8. Telegram 4096-char message truncation guard
+"""
+import glob
+import logging
+import os
+import uuid
+from datetime import datetime
+
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
+from telegram.constants import ChatAction
+from telegram.ext import ContextTypes
+
+from src.config import Config
+from src.database import save_detection
+from src.database.models import PH_TZ
+from src.services import generate_alert, get_vlm_service
+from src.services.business_logic import append_record_id
+from src.utils import get_session_manager
+from src.utils.rate_limiter import get_rate_limiter
+
+logger = logging.getLogger(__name__)
+
+# =============================================================================
+# Constants
+# =============================================================================
+CALLBACK_GILT = "pig_type:gilt"
+CALLBACK_SOW = "pig_type:sow"
+DEFAULT_PIG_TYPE_WHEN_DISABLED = "sow"
+TG_MAX_CHARS = 4096  # Telegram message limit
+
+# Whitelist: ถ้าตั้งค่า ALLOWED_USER_IDS ใน .env จะจำกัดเฉพาะ user เหล่านี้
+# ตัวอย่าง: ALLOWED_USER_IDS=123456,789012
+# ถ้าไม่ตั้งค่า (ว่าง) → ทุกคนใช้ได้
+_ALLOWED_IDS: set[int] = set()
+_raw_ids = os.getenv("ALLOWED_USER_IDS", "").strip()
+if _raw_ids:
+    for _id in _raw_ids.split(","):
+        _id = _id.strip()
+        if _id.isdigit():
+            _ALLOWED_IDS.add(int(_id))
+    logger.info(f"🔒 Whitelist enabled: {len(_ALLOWED_IDS)} user(s)")
+
+
+# =============================================================================
+# Helpers
+# =============================================================================
+def _is_allowed(user_id: int) -> bool:
+    """ถ้าไม่มี whitelist → ทุกคนผ่าน"""
+    if not _ALLOWED_IDS:
+        return True
+    return user_id in _ALLOWED_IDS
+
+
+def _truncate(text: str, limit: int = TG_MAX_CHARS) -> str:
+    """ตัดข้อความให้ไม่เกิน Telegram limit พร้อมแจ้งว่าถูกตัด"""
+    if len(text) <= limit:
+        return text
+    suffix = "\n\n⚠️ [ข้อความถูกตัดเพราะยาวเกินขีดจำกัด / Message truncated]"
+    return text[: limit - len(suffix)] + suffix
+
+
+async def _check_rate_limit(update: Update) -> bool:
+    """ตรวจ rate limit — return True ถ้าผ่าน"""
+    user_id = update.effective_user.id
+    limiter = get_rate_limiter()
+    result = limiter.check(user_id)
+    if not result.allowed:
+        logger.warning(
+            f"🚦 Rate limit blocked user={user_id} "
+            f"retry_after={result.retry_after_seconds}s"
+        )
+        await update.message.reply_text(
+            f"⏳ ส่งบ่อยเกินไป กรุณารออีก {result.retry_after_seconds} วินาที\n"
+            f"⏳ Too many requests. Please wait {result.retry_after_seconds} seconds.\n"
+            f"(จำกัด {limiter.max_requests} ครั้ง / {limiter.window_seconds} วินาที | "
+            f"Limit: {limiter.max_requests} requests / {limiter.window_seconds}s)"
+        )
+        return False
+    return True
+
+
+def _cleanup_stale_temp_images() -> int:
+    """ลบไฟล์ temp ที่ค้างอยู่นานเกิน SESSION_TIMEOUT_MINUTES * 2"""
+    threshold = Config.SESSION_TIMEOUT_MINUTES * 60 * 2
+    now = datetime.now().timestamp()
+    removed = 0
+    pattern = os.path.join(Config.TEMP_IMAGE_DIR, "*.jpg")
+    for filepath in glob.glob(pattern):
+        try:
+            if now - os.path.getmtime(filepath) > threshold:
+                os.remove(filepath)
+                removed += 1
+        except Exception as e:
+            logger.warning(f"Could not remove stale temp image {filepath}: {e}")
+    if removed:
+        logger.info(f"🧹 Removed {removed} stale temp image(s)")
+    return removed
+
+
+# =============================================================================
+# Periodic cleanup job (ลงทะเบียนใน main.py ผ่าน job_queue)
+# =============================================================================
+async def periodic_cleanup(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """รันทุก 5 นาที — cleanup session, rate limiter, temp images"""
+    session_mgr = get_session_manager()
+    session_mgr.cleanup_expired()
+
+    limiter = get_rate_limiter()
+    cleaned = limiter.cleanup_inactive()
+    if cleaned:
+        logger.info(f"🧹 Rate limiter: removed {cleaned} inactive user(s)")
+
+    _cleanup_stale_temp_images()
+
+
+# =============================================================================
+# Command handlers
+# =============================================================================
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not _is_allowed(user.id):
+        await update.message.reply_text(
+            "⛔ ขออภัย คุณไม่มีสิทธิ์ใช้งานระบบนี้\n"
+            "⛔ Sorry, you are not authorized to use this system."
+        )
+        return
+    msg = (
+        f"สวัสดีครับ คุณ {user.first_name} 👋\n"
+        "🐷 ระบบตรวจจับการเป็นสัดของสุกร\n\n"
+        "📸 วิธีใช้งาน:\n"
+        "  1. ถ่ายรูปก้นของหมูให้ชัดเจน\n"
+        "  2. ส่งรูปเข้ามาที่บอทนี้\n"
+    )
+    if Config.ENABLE_GILT_SELECTION:
+        msg += (
+            "  3. เลือกประเภทหมู (หมูสาว / หมูนาง)\n"
+            "  4. รอผลภายในไม่กี่วินาที\n\n"
+        )
+    else:
+        msg += "  3. รอผลภายในไม่กี่วินาที\n\n"
+    msg += "💡 ถ่ายในที่แสงเพียงพอ ระยะใกล้พอเห็นรายละเอียด\n\n"
+    msg += "---\n"
+    msg += (
+        f"Hello, {user.first_name} 👋\n"
+        "🐷 Swine Estrus Detection System\n\n"
+        "📸 How to use:\n"
+        "  1. Take a clear photo of the pig's rear\n"
+        "  2. Send the photo to this bot\n"
+    )
+    if Config.ENABLE_GILT_SELECTION:
+        msg += (
+            "  3. Select pig type (Gilt / Sow)\n"
+            "  4. Wait a few seconds for results\n\n"
+        )
+    else:
+        msg += "  3. Wait a few seconds for results\n\n"
+    msg += "💡 Good lighting and close-up shots give better results"
+    await update.message.reply_text(msg)
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_allowed(update.effective_user.id):
+        await update.message.reply_text(
+            "⛔ ขออภัย คุณไม่มีสิทธิ์ใช้งานระบบนี้\n"
+            "⛔ Sorry, you are not authorized to use this system."
+        )
+        return
+    msg = (
+        "📖 คู่มือการใช้งาน\n\n"
+        "• ส่งรูป → บอทวิเคราะห์ → ส่งผลกลับ\n\n"
+        "คำสั่ง:\n"
+        "/start  - เริ่มต้น\n"
+        "/help   - คู่มือ\n"
+        "/cancel - ยกเลิก session\n"
+        "/stats  - สถิติการใช้งาน\n\n"
+        "ผลที่จะได้:\n"
+        "🚨 Standing Estrus - เป็นสัด พร้อมผสม\n"
+        "⚠️ Pre-Estrus      - ก่อนเป็นสัด\n"
+        "ℹ️ Post-Estrus     - หลังเป็นสัด\n"
+        "✅ Non-Estrus      - ยังไม่เป็นสัด\n"
+        "🛑 False Estrus    - สงสัยเป็นสัดเทียม\n\n"
+        "---\n"
+        "📖 User Guide\n\n"
+        "• Send photo → Bot analyzes → Results returned\n\n"
+        "Commands:\n"
+        "/start  - Start\n"
+        "/help   - Help\n"
+        "/cancel - Cancel session\n"
+        "/stats  - Usage statistics\n\n"
+        "Results:\n"
+        "🚨 Standing Estrus - In heat, ready to breed\n"
+        "⚠️ Pre-Estrus      - Approaching heat\n"
+        "ℹ️ Post-Estrus     - Heat has passed\n"
+        "✅ Non-Estrus      - Not in heat\n"
+        "🛑 False Estrus    - Suspected false heat"
+    )
+    await update.message.reply_text(msg)
+
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    session_mgr = get_session_manager()
+    if session_mgr.get(user_id):
+        session_mgr.clear(user_id)
+        await update.message.reply_text(
+            "✅ ยกเลิกแล้ว ส่งรูปใหม่ได้เลยครับ\n"
+            "✅ Cancelled. You can send a new photo now."
+        )
+    else:
+        await update.message.reply_text(
+            "ไม่มี session ที่ค้างอยู่\n"
+            "No active session found."
+        )
+
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /stats — แสดงสถิติจาก DB (เฉพาะ whitelist หรือทุกคนถ้าไม่ได้ตั้ง whitelist)
+    """
+    if not _is_allowed(update.effective_user.id):
+        await update.message.reply_text(
+            "⛔ ขออภัย คุณไม่มีสิทธิ์ใช้งานระบบนี้\n"
+            "⛔ Sorry, you are not authorized to use this system."
+        )
+        return
+
+    try:
+        from sqlalchemy import func
+
+        from src.database.db import get_session as db_session
+        from src.database.models import EstrusDetection
+
+        with db_session() as session:
+            total = session.query(func.count(EstrusDetection.id)).scalar() or 0
+            today_start = datetime.now(PH_TZ).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            today = (
+                session.query(func.count(EstrusDetection.id))
+                .filter(EstrusDetection.created_at >= today_start)
+                .scalar() or 0
+            )
+            by_class = (
+                session.query(
+                    EstrusDetection.estrus_classification,
+                    func.count(EstrusDetection.id),
+                )
+                .group_by(EstrusDetection.estrus_classification)
+                .all()
+            )
+
+        emoji_map = {
+            "Standing Estrus": "🚨",
+            "Pre-Estrus": "⚠️",
+            "Post-Estrus": "ℹ️",
+            "Non-Estrus": "✅",
+            "False Estrus or Pathology Suspect": "🛑",
+        }
+
+        lines = [
+            "📊 สถิติการวิเคราะห์\n",
+            f"  • ทั้งหมด    : {total} ครั้ง",
+            f"  • วันนี้      : {today} ครั้ง\n",
+            "แยกตาม Classification:",
+        ]
+        for cls, cnt in sorted(by_class, key=lambda x: -x[1]):
+            emoji = emoji_map.get(cls, "•")
+            lines.append(f"  {emoji} {cls}: {cnt}")
+
+        lines += [
+            "\n---",
+            "📊 Analysis Statistics\n",
+            f"  • Total   : {total} records",
+            f"  • Today   : {today} records\n",
+            "By Classification:",
+        ]
+        for cls, cnt in sorted(by_class, key=lambda x: -x[1]):
+            emoji = emoji_map.get(cls, "•")
+            lines.append(f"  {emoji} {cls}: {cnt}")
+
+        await update.message.reply_text("\n".join(lines))
+
+    except Exception as e:
+        logger.error(f"Stats command error: {e}", exc_info=True)
+        await update.message.reply_text(
+            "❌ ไม่สามารถดึงสถิติได้ในขณะนี้\n"
+            "❌ Unable to retrieve statistics at this time."
+        )
+
+
+# =============================================================================
+# Photo handler
+# =============================================================================
+async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """รับรูป → ดาวน์โหลด → เก็บใน session"""
+    user = update.effective_user
+    message = update.message
+
+    # === Whitelist check ===
+    if not _is_allowed(user.id):
+        await message.reply_text(
+            "⛔ ขออภัย คุณไม่มีสิทธิ์ใช้งานระบบนี้\n"
+            "⛔ Sorry, you are not authorized to use this system."
+        )
+        return
+
+    # === Rate limit ===
+    if not await _check_rate_limit(update):
+        return
+
+    await context.bot.send_chat_action(
+        chat_id=message.chat_id, action=ChatAction.TYPING
+    )
+
+    try:
+        photo = message.photo[-1]
+        file_id = photo.file_id
+        photo_file = await context.bot.get_file(file_id)
+
+        timestamp = datetime.now(PH_TZ).strftime("%Y%m%d_%H%M%S")
+        filename = f"{user.id}_{timestamp}_{uuid.uuid4().hex[:4]}.jpg"
+        image_path = os.path.join(Config.TEMP_IMAGE_DIR, filename)
+        await photo_file.download_to_drive(image_path)
+        logger.info(f"📥 Image downloaded: {image_path}")
+
+        session_mgr = get_session_manager()
+        session_mgr.create(
+            user_id=user.id,
+            username=user.username,
+            first_name=user.first_name,
+            image_path=image_path,
+            image_file_id=file_id,
+        )
+
+        # === Path A: เปิดปุ่มเลือก ===
+        if Config.ENABLE_GILT_SELECTION:
+            keyboard = [
+                [
+                    InlineKeyboardButton("🐷 หมูสาว (Gilt)", callback_data=CALLBACK_GILT),
+                    InlineKeyboardButton("🐖 หมูนาง (Sow)", callback_data=CALLBACK_SOW),
+                ]
+            ]
+            await message.reply_text(
+                "✅ ได้รับรูปแล้ว / Photo received\n"
+                "🐷 กรุณาเลือกประเภทของหมู / Please select pig type:",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+            return
+
+        # === Path B: ปิดปุ่มเลือก → วิเคราะห์เลย ===
+        sent = await message.reply_text(
+            "🔍 กำลังวิเคราะห์ภาพ (หมูนาง) / Analyzing (Sow)...\n"
+            "⏱️ กรุณารอสักครู่... / Please wait..."
+        )
+        await _run_analysis_pipeline(
+            update=update,
+            context=context,
+            pig_type=DEFAULT_PIG_TYPE_WHEN_DISABLED,
+            edit_target=sent,
+        )
+
+    except Exception:
+        logger.error("❌ Photo handler error", exc_info=True)
+        await message.reply_text(
+            "❌ เกิดข้อผิดพลาดในการรับรูปภาพ กรุณาลองใหม่อีกครั้ง\n"
+            "❌ Error receiving photo. Please try again."
+        )
+
+
+# =============================================================================
+# Callback handler
+# =============================================================================
+async def pig_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    callback_data = query.data or ""
+    if not callback_data.startswith("pig_type:"):
+        return
+
+    pig_type = callback_data.split(":", 1)[1]
+    pig_label = "หมูสาว (Gilt)" if pig_type == "gilt" else "หมูนาง (Sow)"
+
+    await query.edit_message_text(
+        f"🔍 กำลังวิเคราะห์ภาพ ({pig_label}) / Analyzing ({pig_label})...\n"
+        "⏱️ กรุณารอสักครู่... / Please wait..."
+    )
+    await context.bot.send_chat_action(
+        chat_id=query.message.chat_id, action=ChatAction.TYPING
+    )
+    await _run_analysis_pipeline(
+        update=update,
+        context=context,
+        pig_type=pig_type,
+        edit_target=query.message,
+        use_edit=True,
+    )
+
+
+# =============================================================================
+# Text handler
+# =============================================================================
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if not _is_allowed(user_id):
+        await update.message.reply_text(
+            "⛔ ขออภัย คุณไม่มีสิทธิ์ใช้งานระบบนี้\n"
+            "⛔ Sorry, you are not authorized to use this system."
+        )
+        return
+
+    await update.message.reply_text(
+        "📸 กรุณาส่งรูปภาพของหมูเข้ามาเพื่อวิเคราะห์\n"
+        "📸 Please send a pig photo to analyze.\n\n"
+        "พิมพ์ /help เพื่อดูคู่มือ / Type /help for instructions."
+    )
+
+
+# =============================================================================
+# Core pipeline
+# =============================================================================
+async def _run_analysis_pipeline(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    pig_type: str,
+    edit_target,
+    use_edit: bool = False,
+) -> None:
+    """Pipeline สำหรับทั้ง 2 flow (มีปุ่ม / ไม่มีปุ่ม)"""
+    user = update.effective_user
+    session_mgr = get_session_manager()
+    session = session_mgr.get(user.id)
+
+    if session is None:
+        text = (
+            "⏰ ไม่พบรูปที่ส่งไว้ / Photo not found\n"
+            "อาจเป็นเพราะ / Possible reasons:\n"
+            "  • กดปุ่มเลือกซ้ำ / Button pressed twice\n"
+            f"  • ส่งรูปไว้นานเกิน {Config.SESSION_TIMEOUT_MINUTES} นาที / "
+            f"Photo expired after {Config.SESSION_TIMEOUT_MINUTES} min\n\n"
+            "📸 กรุณาส่งรูปใหม่อีกครั้ง / Please send a new photo."
+        )
+        if use_edit:
+            await edit_target.edit_text(text)
+        else:
+            await edit_target.reply_text(text)
+        return
+
+    try:
+        # === VLM ===
+        vlm = get_vlm_service()
+        vlm_result = await vlm.analyze_estrus(
+            image_path=session.image_path, pig_type=pig_type
+        )
+
+        # === Business logic ===
+        alert = generate_alert(vlm_result, pig_type)
+
+        # === Save DB ===
+        detection_id = save_detection(
+            telegram_user_id=user.id,
+            telegram_username=user.username,
+            telegram_first_name=user.first_name,
+            pig_type=pig_type,
+            image_file_id=session.image_file_id,
+            image_path=session.image_path,
+            vlm_result=vlm_result,
+            result_status=alert.status,
+            alert_message=alert.message,
+        )
+
+        # === Compose final + truncate guard ===
+        final_text = append_record_id(alert.message, detection_id)
+        final_text = _truncate(final_text)
+
+        if use_edit:
+            await edit_target.edit_text(final_text)
+        else:
+            await edit_target.reply_text(final_text)
+
+        logger.info(
+            f"✅ Pipeline done user={user.id} pig_type={pig_type} "
+            f"class={alert.classification} status={alert.status} "
+            f"record_id={detection_id}"
+        )
+
+    except Exception:
+        logger.error("❌ Pipeline error", exc_info=True)
+        text = (
+            "❌ เกิดข้อผิดพลาดในการวิเคราะห์ กรุณาลองส่งรูปใหม่อีกครั้ง\n"
+            "❌ Analysis error. Please try sending a new photo."
+        )
+        if use_edit:
+            await edit_target.edit_text(text)
+        else:
+            await edit_target.reply_text(text)
+    finally:
+        session_mgr.clear(user.id)
+
+
+# =============================================================================
+# Error handler
+# =============================================================================
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error("⚠️ Update caused error:", exc_info=context.error)
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_text(
+                "❌ เกิดข้อผิดพลาดในระบบ กรุณาลองใหม่อีกครั้ง\n"
+                "❌ System error. Please try again."
+            )
+        except Exception:
+            pass
