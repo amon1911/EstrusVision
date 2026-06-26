@@ -45,6 +45,9 @@ DEFAULT_PIG_TYPE_WHEN_DISABLED = "gilt"
 TG_MAX_CHARS = 4096
 STORAGE_DIR = "./storage"
 
+# Lock per user — ป้องกันรับรูป 2 ใบพร้อมกัน
+_processing_users: set[int] = set()
+
 # =============================================================================
 # Daily limit counter (in-memory, รีเซ็ตตามวัน PH)
 # =============================================================================
@@ -782,7 +785,9 @@ async def _run_analysis_pipeline(
         else:
             await edit_target.reply_text(text)
     finally:
+        _processing_users.discard(user.id)
         session_mgr.clear(user.id)
+        logger.info(f"🔓 Processing lock released for user={user.id}")
 
 
 # =============================================================================
