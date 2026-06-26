@@ -481,6 +481,15 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await photo_file.download_to_drive(image_path)
         logger.info(f"📥 Image downloaded: {image_path}")
 
+        # === เช็คว่ากำลังวิเคราะห์อยู่ไหม ===
+        session_mgr = get_session_manager()
+        if session_mgr.get(user.id):
+            await message.reply_text(
+                "⏳ กำลังวิเคราะห์รูปก่อนหน้าอยู่ กรุณารอสักครู่\n"
+                "⏳ Previous photo is being analyzed. Please wait."
+            )
+            return
+
         # === เช็ค Daily Limit ===
         allowed, current_count = _check_daily_limit()
         if not allowed:
@@ -497,7 +506,6 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # === เพิ่ม counter ===
         _increment_daily_count()
 
-        session_mgr = get_session_manager()
         session_mgr.create(
             user_id=user.id,
             username=user.username,
@@ -540,6 +548,70 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =============================================================================
+# Auto-analyze job (timeout 10 วิ)
+# =============================================================================
+async def _auto_analyze_sow(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """รันอัตโนมัติถ้า user ไม่กดปุ่มเลือกภายใน 10 วิ"""
+    data = context.job.data
+    user_id = data["user_id"]
+    chat_id = data["chat_id"]
+    message_id = data["message_id"]
+
+    session_mgr = get_session_manager()
+    session = session_mgr.get(user_id)
+    if session is None:
+        # user กดปุ่มไปแล้ว session cleared แล้ว ไม่ต้องทำอะไร
+        return
+
+    logger.info(f"⏱️ Auto-analyze as Sow for user={user_id} (timeout)")
+
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=(
+                "⏱️ ไม่ได้เลือกประเภทหมู → วิเคราะห์เป็น หมูนาง (Sow) อัตโนมัติ\n"
+                "⏱️ No selection → Auto-analyzing as Sow...\n"
+                "กรุณารอสักครู่... / Please wait..."
+            ),
+        )
+    except Exception:
+        pass
+
+    # สร้าง fake update object สำหรับ pipeline
+    class _FakeUser:
+        id = user_id
+        username = session.username if session else None
+        first_name = session.first_name if session else ""
+
+    class _FakeMessage:
+        chat_id = chat_id
+
+        async def edit_text(self, text, **kwargs):
+            await context.bot.edit_message_text(
+                chat_id=chat_id, message_id=message_id, text=text
+            )
+
+        async def reply_text(self, text, **kwargs):
+            await context.bot.send_message(chat_id=chat_id, text=text)
+
+    class _FakeUpdate:
+        effective_user = _FakeUser()
+        message = _FakeMessage()
+
+    fake_update = _FakeUpdate()
+    fake_message = _FakeMessage()
+
+    await _run_analysis_pipeline(
+        update=fake_update,
+        context=context,
+        pig_type="sow",
+        edit_target=fake_message,
+        use_edit=True,
+    )
+
+
+# =============================================================================
 # Callback handler
 # =============================================================================
 async def pig_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -552,6 +624,13 @@ async def pig_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     pig_type = callback_data.split(":", 1)[1]
     pig_label = "หมูสาว (Gilt)" if pig_type == "gilt" else "หมูนาง (Sow)"
+
+    # ยกเลิก auto-analyze job ถ้า user กดเลือกเอง
+    user_id = query.from_user.id
+    current_jobs = context.job_queue.get_jobs_by_name(f"auto_sow_{user_id}")
+    for job in current_jobs:
+        job.schedule_removal()
+    logger.info(f"✅ Auto-analyze job cancelled for user={user_id} (manual selection)")
 
     await query.edit_message_text(
         f"🔍 กำลังวิเคราะห์ภาพ ({pig_label}) / Analyzing ({pig_label})...\n"
