@@ -140,8 +140,11 @@ class VLMService:
                 logger.error(f"Image not found: {image_path}")
                 return self._error_response("ไม่พบไฟล์รูปภาพ")
 
-            # 🆕 Preprocess รูปก่อนส่ง
+            # 🆕 Preprocess รูปก่อนส่ง + แปลงเป็น base64
             image = self._preprocess_image(image_path_obj)
+            _buf = io.BytesIO()
+            image.save(_buf, format="JPEG", quality=75)
+            image_part = types.Part.from_bytes(data=_buf.getvalue(), mime_type="image/jpeg")
 
             # Build prompt + Safety Evasion
             raw_prompt = build_estrus_prompt(pig_type)
@@ -165,7 +168,7 @@ class VLMService:
 
             response = await self.client.aio.models.generate_content(
                 model=self.model_name,
-                contents=[evaded_prompt, image],
+                contents=[evaded_prompt, image_part],
                 config=self.generation_config,
             )
 
