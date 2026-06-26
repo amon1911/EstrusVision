@@ -116,8 +116,14 @@ class VLMService:
         # Convert เป็น grayscale แล้วกลับเป็น RGB (ลด sensitive content)
         if img.mode in ("RGBA", "P"):
             img = img.convert("RGB")
+        # Crop เฉพาะครึ่งล่างของรูป (ส่วนที่วิเคราะห์ได้)
+        w, h = img.size
+        img = img.crop((0, h // 2, w, h))
+        logger.info(f"🖼️ Image cropped to lower half: {img.size}")
+
+        # Convert เป็น grayscale
         img = img.convert("L").convert("RGB")
-        logger.info("🖼️ Image converted to grayscale to reduce safety filter trigger")
+        logger.info("🖼️ Image converted to grayscale")
 
         # Resize ถ้าใหญ่เกิน
         if img.width > IMAGE_MAX_SIZE[0] or img.height > IMAGE_MAX_SIZE[1]:
